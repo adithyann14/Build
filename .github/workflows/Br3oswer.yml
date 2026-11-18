@@ -116,7 +116,7 @@ jobs:
         cd "$GITHUB_WORKSPACE/${{ env.SRC_DIR }}"
         repo init --depth=1 -u ${{ env.SYNC_URL }} -b ${{ env.MANIFEST_BRANCH }}
         repo sync -c --force-sync --no-clone-bundle --no-tags -j$(nproc)
-                    
+
     - name: AERA - blank screen on boot only for non-NVT panels
       run: |
         # TW_SCREEN_BLANK_ON_BOOT (aeraui/platform/aera_ui_host.cpp, gui_init)
@@ -343,6 +343,86 @@ jobs:
         COMMIT=$(git rev-parse --short=7 HEAD)
         echo "commit=$COMMIT" >> $GITHUB_OUTPUT
         echo "device tree: $COMMIT"
+
+    # Size reduction: strip NTFS + extra languages and apply the "drastic" size
+    # reduction LAST, in both the vendor setup (vendorsetup.sh) and BoardConfig.mk,
+    # so nothing later in the device tree can override it.
+    # Names: the AERA_* form is written next to the legacy TW_/FOX_ form, because
+    # whichever prefix the AERA build reads is the one that takes effect (the
+    # "which prefix does the tree read" step below prints it).
+    # Deliberately NOT added: OF_USE_LZMA_COMPRESSION (the sky kernel has
+    # CONFIG_RD_LZMA unset, so an LZMA ramdisk would not boot).
+    - name: AERA - strip NTFS + languages, drastic size reduction (last in vendorsetup + BoardConfig)
+      run: |
+        set -e
+        D="${{ env.SRC_DIR }}/${{ env.DEVICE_PATH }}"
+        MARK="AERA_SIZE_REDUCTION_PATCH"
+        [ -d "$D" ] || { echo "::error::$D not found"; exit 1; }
+
+        # 1a) drop a previous run's block, 1b) delete any earlier assignment anywhere in the
+        #     device tree, so the final block appended below is the only one
+        while IFS= read -r f; do
+          sed -i "/# >>> $MARK/,/# <<< $MARK/d" "$f"
+        done < <(find "$D" -type f \( -name '*.mk' -o -name 'vendorsetup.sh' \) -not -path '*/.git/*')
+        FLAGS='(TW|AERA)_(INCLUDE_NTFS_3G|EXTRA_LANGUAGES)|(FOX|AERA)_DRASTIC_SIZE_REDUCTION'
+        while IFS= read -r f; do
+          if grep -qE "^[[:space:]]*(export[[:space:]]+)?($FLAGS)[[:space:]]*[:?+]?=" "$f"; then
+            echo "removing earlier assignments in $f:"
+            grep -nE "^[[:space:]]*(export[[:space:]]+)?($FLAGS)[[:space:]]*[:?+]?=" "$f" | sed 's/^/    /'
+            sed -i -E "/^[[:space:]]*(export[[:space:]]+)?($FLAGS)[[:space:]]*[:?+]?=/d" "$f"
+          fi
+        done < <(find "$D" -type f \( -name '*.mk' -o -name 'vendorsetup.sh' \) -not -path '*/.git/*')
+
+        # kernel has no LZMA ramdisk support: warn, never silently ship an unbootable recovery
+        if grep -rnE "OF_USE_LZMA_COMPRESSION|AERA_USE_LZMA_COMPRESSION" "$D" --include=*.mk --include=*.sh 2>/dev/null; then
+          echo "::warning::LZMA ramdisk compression is set above, but this kernel has CONFIG_RD_LZMA unset - the recovery will not boot. Remove it."
+        fi
+
+        # 2) BoardConfig.mk: append last
+        BC="$D/BoardConfig.mk"
+        [ -f "$BC" ] || { echo "::error::$BC not found"; exit 1; }
+        [ -n "$(tail -c1 "$BC")" ] && echo >> "$BC"
+        cat >> "$BC" <<'BCEOF'
+        # >>> AERA_SIZE_REDUCTION_PATCH (keep last)
+        TW_INCLUDE_NTFS_3G :=
+        AERA_INCLUDE_NTFS_3G :=
+        TW_EXTRA_LANGUAGES :=
+        AERA_EXTRA_LANGUAGES :=
+        AERA_DRASTIC_SIZE_REDUCTION := 1
+        FOX_DRASTIC_SIZE_REDUCTION := 1
+        # <<< AERA_SIZE_REDUCTION_PATCH
+        BCEOF
+
+        # 3) vendorsetup.sh: append last (created if the tree has none)
+        VS="$D/vendorsetup.sh"
+        [ -f "$VS" ] || { echo "#!/bin/bash" > "$VS"; echo "created $VS"; }
+        [ -n "$(tail -c1 "$VS")" ] && echo >> "$VS"
+        cat >> "$VS" <<'VSEOF'
+        # >>> AERA_SIZE_REDUCTION_PATCH (must stay after every other export)
+        export AERA_DRASTIC_SIZE_REDUCTION=1
+        export FOX_DRASTIC_SIZE_REDUCTION=1
+        # <<< AERA_SIZE_REDUCTION_PATCH
+        VSEOF
+
+        bash -n "$VS"
+        echo "---- tail of $BC ----";  tail -n 10 "$BC"
+        echo "---- tail of $VS ----";  tail -n 8  "$VS"
+        # the marker must be present exactly once per file
+        [ "$(grep -c "$MARK" "$BC")" = 2 ] && [ "$(grep -c "$MARK" "$VS")" = 2 ] \
+          || { echo "::error::patch markers not found exactly once in BoardConfig.mk / vendorsetup.sh"; exit 1; }
+
+    # Informational: which flag prefix does the AERA tree actually read?
+    - name: AERA - which flag prefix does the build read (informational)
+      continue-on-error: true
+      run: |
+        mkdir -p "$GITHUB_WORKSPACE/logs"
+        cd "${{ env.SRC_DIR }}"
+        grep -rIn -E "(FOX|AERA|OF)_DRASTIC_SIZE_REDUCTION|(TW|AERA)_(INCLUDE_NTFS_3G|EXTRA_LANGUAGES)" \
+          bootable/recovery build vendor 2>/dev/null \
+          --include=*.mk --include=*.sh --include=*.bp --include=Android.* --include=*.cpp \
+          | head -80 | tee "$GITHUB_WORKSPACE/logs/flag-prefixes.txt" || true
+        echo "AERA_ matches : $(grep -c 'AERA_' "$GITHUB_WORKSPACE/logs/flag-prefixes.txt" || true)"
+        echo "TW_/FOX_ matches: $(grep -cE '(TW|FOX)_' "$GITHUB_WORKSPACE/logs/flag-prefixes.txt" || true)"
 
     # Shell "patch": drops the probe script into the device tree's recovery
     # ramdisk overlay and starts it from init. Idempotent (skips the rc edit if
@@ -849,6 +929,9 @@ jobs:
 
         export ALLOW_MISSING_DEPENDENCIES=true
         lunch ${{ env.MAKEFILE_NAME }}
+
+        # size reduction must be the LAST exports before the build starts
+        export AERA_DRASTIC_SIZE_REDUCTION=1 FOX_DRASTIC_SIZE_REDUCTION=1
 
         # full console output is also kept as an artifact (recovery-build-logs)
         mka adbd ${{ env.BUILD_TARGET }}image -j$(nproc --all) 2>&1 | tee "$GITHUB_WORKSPACE/logs/mka.log"
